@@ -6,3 +6,6 @@ __pycache__/
 .pytest_cache/
 .DS_Store
 *.log
+
+# Приватные заметки и план — не для репозитория
+ROADMAP.md
