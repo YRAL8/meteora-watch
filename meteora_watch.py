@@ -122,6 +122,14 @@ def ensure_db(path: str) -> sqlite3.Connection:
         "CREATE INDEX IF NOT EXISTS idx_observations_day ON observations(day);"
     )
 
+    # fees_usd теперь хранит комиссии ЗА ВЫЧЕТОМ доли протокола (то, что реально
+    # достаётся поставщику ликвидности). Валовые и долю протокола храним рядом,
+    # чтобы расхождение было видно и чтобы старые строки можно было пересчитать.
+    existing = {r[1] for r in conn.execute("PRAGMA table_info(observations);")}
+    for col in ("fees_gross_usd", "protocol_fees_usd"):
+        if col not in existing:
+            conn.execute(f"ALTER TABLE observations ADD COLUMN {col} REAL")
+
     # Lightweight migration for early schema versions (INTEGER -> TEXT for rentEpoch).
     try:
         cols = {r[1]: (r[2] or "").upper() for r in conn.execute("PRAGMA table_info(observations);")}
@@ -573,7 +581,24 @@ def collect(
                 if fees is None:
                     raise RuntimeError("fees missing in history point")
 
-                apr_simple_pct = fees / tvl * 365.0 * 100.0
+                # Поле `fees` — ВАЛОВЫЕ комиссии, взятые с трейдеров; часть их забирает
+                # протокол и до поставщика ликвидности она не доходит. Проверено на
+                # 9 днях подряд: protocol_fees / fees держится ровно на 11.1-11.2%,
+                # такая устойчивость бывает только когда одно является частью другого.
+                # Без вычета доходность завышается примерно на 11% — а именно на этих
+                # числах принимается решение о переезде позиции, так что ошибка не
+                # безобидная.
+                protocol_fees = parse_float(pt.get("protocol_fees")) or 0.0
+                fees_lp = fees - protocol_fees
+                if fees_lp < 0:
+                    # Не должно случаться; если случилось — данные странные, не гадаем.
+                    log.warning(
+                        "protocol_fees (%.2f) больше fees (%.2f) за %s — беру валовые",
+                        protocol_fees, fees, day,
+                    )
+                    fees_lp = fees
+
+                apr_simple_pct = fees_lp / tvl * 365.0 * 100.0
                 updated_at = datetime.now(timezone.utc).isoformat()
 
                 row: Dict[str, Any] = {
@@ -583,7 +608,9 @@ def collect(
                     "token_x_symbol": safe_get(details, "token_x", "symbol") or token_x_symbol,
                     "token_y_symbol": safe_get(details, "token_y", "symbol") or token_y_symbol,
                     "tvl_usd": float(tvl),
-                    "fees_usd": float(fees),
+                    "fees_usd": float(fees_lp),
+                    "fees_gross_usd": float(fees),
+                    "protocol_fees_usd": float(protocol_fees),
                     "apr_simple_pct": float(apr_simple_pct),
                     "api_dynamic_fee_pct": api_dynamic_fee_pct,
                     "api_apr_24h_pct": api_apr_24h_pct,
