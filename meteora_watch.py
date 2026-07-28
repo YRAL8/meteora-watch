@@ -9,6 +9,7 @@ import statistics
 import sys
 import time
 from dataclasses import dataclass
+from decimal import Decimal, getcontext
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
@@ -19,14 +20,30 @@ METEORA_API_BASE = "https://dlmm.datapi.meteora.ag"
 SOLANA_MAINNET_RPC_DEFAULT = "https://api.mainnet-beta.solana.com"
 DLMM_PROGRAM_ID = "LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo"
 
+ORCA_WHIRLPOOL_PROGRAM_ID = "whirLbMiicVdio4qvUfM5KAg6Ct8VwpYzGff3uctyCc"
+ORCA_SOL_USDC_POOL = "Czfq3xZZDmsdGdUyrNLtRhGc47cXcZtLG4crryfu44zE"
+ORCA_SOL_MINT = "So11111111111111111111111111111111111111112"
+ORCA_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
+
 DEFI_LLAMA_ORCA_SOL_USDC_CHART = "a5c85bc8-eb41-45c0-a520-d18d7529c0d8"
 DEFI_LLAMA_YIELDS_CHART_URL = f"https://yields.llama.fi/chart/{DEFI_LLAMA_ORCA_SOL_USDC_CHART}"
 
 # Anchor discriminator for account "LbPair" from Meteora DLMM IDL.
 LBPAIR_DISCRIMINATOR = bytes([33, 11, 49, 98, 181, 101, 177, 13])
+BINARRAY_DISCRIMINATOR = bytes([92, 142, 92, 220, 5, 148, 70, 181])
+
+# Orca Whirlpools discriminators (Codama-generated TS SDK).
+WHIRLPOOL_DISCRIMINATOR = bytes([63, 149, 209, 12, 225, 128, 99, 9])
+FIXED_TICK_ARRAY_DISCRIMINATOR = bytes([69, 97, 189, 190, 110, 7, 66, 187])
 
 FEE_DENOMINATOR = 1_000_000_000
 MAX_FEE_RATE_1E9 = 100_000_000  # 10% in 1e9 precision
+
+TICKS_PER_TICK_ARRAY = 88
+BINS_PER_BIN_ARRAY = 70
+
+# Decimal precision for liquidity math (Orca).
+getcontext().prec = 50
 
 
 def eprint(*args: Any) -> None:
@@ -379,6 +396,125 @@ def solana_get_account_info(
     )
 
 
+def solana_rpc_call(
+    session: requests.Session,
+    rpc_url: str,
+    method: str,
+    params: List[Any],
+    *,
+    sleep_s: float,
+    timeout_s: float = 25.0,
+    retries: int = 5,
+) -> Any:
+    payload = {"jsonrpc": "2.0", "id": 1, "method": method, "params": params}
+    return request_json(
+        session,
+        "POST",
+        rpc_url,
+        json_body=payload,
+        sleep_s=sleep_s,
+        timeout_s=timeout_s,
+        retries=retries,
+    )
+
+
+def _chunks(xs: List[str], n: int) -> Iterable[List[str]]:
+    for i in range(0, len(xs), n):
+        yield xs[i : i + n]
+
+
+def solana_get_multiple_accounts(
+    session: requests.Session,
+    rpc_url: str,
+    pubkeys: List[str],
+    *,
+    sleep_s: float,
+    chunk_size: int = 100,
+) -> Dict[str, Optional[bytes]]:
+    out: Dict[str, Optional[bytes]] = {}
+    for chunk in _chunks(pubkeys, chunk_size):
+        raw = solana_rpc_call(
+            session,
+            rpc_url,
+            "getMultipleAccounts",
+            [chunk, {"encoding": "base64", "commitment": "confirmed"}],
+            sleep_s=sleep_s,
+        )
+        values = safe_get(raw, "result", "value") or []
+        if not isinstance(values, list) or len(values) != len(chunk):
+            raise RuntimeError("unexpected getMultipleAccounts response shape")
+        for pk, v in zip(chunk, values):
+            if not isinstance(v, dict):
+                out[pk] = None
+                continue
+            data = v.get("data")
+            if isinstance(data, list) and data and isinstance(data[0], str):
+                try:
+                    out[pk] = base64.b64decode(data[0])
+                except Exception:
+                    out[pk] = None
+            else:
+                out[pk] = None
+    return out
+
+
+def solana_get_program_accounts(
+    session: requests.Session,
+    rpc_url: str,
+    program_id: str,
+    *,
+    filters: List[Dict[str, Any]],
+    data_slice: Optional[Dict[str, int]],
+    sleep_s: float,
+    with_context: bool = False,
+) -> List[Dict[str, Any]]:
+    cfg: Dict[str, Any] = {
+        "encoding": "base64",
+        "commitment": "confirmed",
+        "filters": filters,
+    }
+    if data_slice is not None:
+        cfg["dataSlice"] = data_slice
+    if with_context:
+        cfg["withContext"] = True
+    raw = solana_rpc_call(
+        session,
+        rpc_url,
+        "getProgramAccounts",
+        [program_id, cfg],
+        sleep_s=sleep_s,
+        timeout_s=40.0,
+        retries=5,
+    )
+    res: Any = raw.get("result") if isinstance(raw, dict) else None
+    if with_context:
+        res = safe_get(raw, "result", "value")
+    if not isinstance(res, list):
+        raise RuntimeError("unexpected getProgramAccounts response shape")
+    return res
+
+
+_B58_ALPHABET = b"123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+
+
+def base58_encode(b: bytes) -> str:
+    if not b:
+        return ""
+    zeros = 0
+    for ch in b:
+        if ch == 0:
+            zeros += 1
+        else:
+            break
+    n = int.from_bytes(b, "big", signed=False)
+    out = bytearray()
+    while n > 0:
+        n, rem = divmod(n, 58)
+        out.append(_B58_ALPHABET[rem])
+    out.reverse()
+    return ("1" * zeros) + out.decode("ascii")
+
+
 @dataclass
 class LbPairFeeParams:
     discriminator_ok: bool
@@ -401,6 +537,26 @@ def _read_u32_le(buf: bytes, off: int) -> int:
 
 def _read_u8(buf: bytes, off: int) -> int:
     return buf[off]
+
+
+def _read_i32_le(buf: bytes, off: int) -> int:
+    return int.from_bytes(buf[off : off + 4], "little", signed=True)
+
+
+def _read_i64_le(buf: bytes, off: int) -> int:
+    return int.from_bytes(buf[off : off + 8], "little", signed=True)
+
+
+def _read_u64_le(buf: bytes, off: int) -> int:
+    return int.from_bytes(buf[off : off + 8], "little", signed=False)
+
+
+def _read_u128_le(buf: bytes, off: int) -> int:
+    return int.from_bytes(buf[off : off + 16], "little", signed=False)
+
+
+def _read_i128_le(buf: bytes, off: int) -> int:
+    return int.from_bytes(buf[off : off + 16], "little", signed=True)
 
 
 def decode_lbpair_fee_params(account_data: bytes) -> LbPairFeeParams:
@@ -477,6 +633,792 @@ def decode_lbpair_fee_params(account_data: bytes) -> LbPairFeeParams:
         fee_rate_1e9=fee_rate_1e9,
         fee_pct=fee_pct,
     )
+
+
+@dataclass
+class LbPairState:
+    discriminator_ok: bool
+    active_id: Optional[int]
+    bin_step: Optional[int]
+
+
+def decode_lbpair_state(account_data: bytes) -> LbPairState:
+    if len(account_data) < 8 + 80:
+        return LbPairState(discriminator_ok=False, active_id=None, bin_step=None)
+    disc = account_data[:8]
+    discriminator_ok = disc == LBPAIR_DISCRIMINATOR
+    body = account_data[8:]
+    try:
+        # Offsets validated against Meteora DLMM IDL:
+        # StaticParameters (32) + VariableParameters (32) + bump_seed(1) + bin_step_seed(2) + pair_type(1) = 68.
+        active_id = _read_i32_le(body, 68)
+        bin_step2 = _read_u16_le(body, 72)
+        return LbPairState(
+            discriminator_ok=discriminator_ok, active_id=active_id, bin_step=bin_step2
+        )
+    except Exception:
+        return LbPairState(discriminator_ok=discriminator_ok, active_id=None, bin_step=None)
+
+
+@dataclass
+class MeteoraBinRow:
+    bin_id: int
+    amount_x: int
+    amount_y: int
+
+
+def decode_binarray_bins_subset(
+    account_data: bytes, *, want_bin_ids: Optional[set]
+) -> Tuple[Optional[int], Optional[str], List[MeteoraBinRow]]:
+    """
+    Decode Meteora BinArray. Returns (bin_array_index, lb_pair_pubkey, bins_subset).
+    - If want_bin_ids is None: returns all bins (still as list).
+    """
+    if len(account_data) < 8 + 48:
+        return None, None, []
+    if account_data[:8] != BINARRAY_DISCRIMINATOR:
+        return None, None, []
+    # Layout: disc(8) + index(i64) + version(u8) + pad7 + lb_pair(pubkey) + bins[70]
+    idx = _read_i64_le(account_data, 8)
+    lb_pair_bytes = account_data[24:56]
+    lb_pair = base58_encode(lb_pair_bytes)
+    bins_off = 56
+    bin_size = 144
+    out: List[MeteoraBinRow] = []
+    for i in range(BINS_PER_BIN_ARRAY):
+        bin_id = idx * BINS_PER_BIN_ARRAY + i
+        if want_bin_ids is not None and bin_id not in want_bin_ids:
+            continue
+        off = bins_off + i * bin_size
+        if off + 16 > len(account_data):
+            break
+        ax = _read_u64_le(account_data, off + 0)
+        ay = _read_u64_le(account_data, off + 8)
+        if ax == 0 and ay == 0:
+            continue
+        out.append(MeteoraBinRow(bin_id=bin_id, amount_x=ax, amount_y=ay))
+    return idx, lb_pair, out
+
+
+@dataclass
+class OrcaWhirlpoolState:
+    discriminator_ok: bool
+    tick_spacing: Optional[int]
+    liquidity: Optional[int]
+    sqrt_price_x64: Optional[int]
+    tick_current_index: Optional[int]
+    token_mint_a: Optional[str]
+    token_mint_b: Optional[str]
+    token_vault_a: Optional[str]
+    token_vault_b: Optional[str]
+    fee_rate: Optional[int]
+
+
+def decode_orca_whirlpool(account_data: bytes) -> OrcaWhirlpoolState:
+    if len(account_data) < 8 + 120:
+        return OrcaWhirlpoolState(
+            discriminator_ok=False,
+            tick_spacing=None,
+            liquidity=None,
+            sqrt_price_x64=None,
+            tick_current_index=None,
+            token_mint_a=None,
+            token_mint_b=None,
+            token_vault_a=None,
+            token_vault_b=None,
+            fee_rate=None,
+        )
+    disc_ok = account_data[:8] == WHIRLPOOL_DISCRIMINATOR
+    try:
+        off = 8
+        off += 32  # whirlpoolsConfig
+        off += 1  # bump
+        tick_spacing = _read_u16_le(account_data, off)
+        off += 2
+        off += 2  # feeTierIndexSeed
+        fee_rate = _read_u16_le(account_data, off)
+        off += 2
+        off += 2  # protocolFeeRate
+        liquidity = _read_u128_le(account_data, off)
+        off += 16
+        sqrt_price_x64 = _read_u128_le(account_data, off)
+        off += 16
+        tick_current_index = _read_i32_le(account_data, off)
+        off += 4
+        off += 8 + 8  # protocolFeeOwedA/B
+        token_mint_a = base58_encode(account_data[off : off + 32])
+        off += 32
+        token_vault_a = base58_encode(account_data[off : off + 32])
+        off += 32
+        off += 16  # feeGrowthGlobalA
+        token_mint_b = base58_encode(account_data[off : off + 32])
+        off += 32
+        token_vault_b = base58_encode(account_data[off : off + 32])
+        return OrcaWhirlpoolState(
+            discriminator_ok=disc_ok,
+            tick_spacing=tick_spacing,
+            liquidity=liquidity,
+            sqrt_price_x64=sqrt_price_x64,
+            tick_current_index=tick_current_index,
+            token_mint_a=token_mint_a,
+            token_mint_b=token_mint_b,
+            token_vault_a=token_vault_a,
+            token_vault_b=token_vault_b,
+            fee_rate=fee_rate,
+        )
+    except Exception:
+        return OrcaWhirlpoolState(
+            discriminator_ok=disc_ok,
+            tick_spacing=None,
+            liquidity=None,
+            sqrt_price_x64=None,
+            tick_current_index=None,
+            token_mint_a=None,
+            token_mint_b=None,
+            token_vault_a=None,
+            token_vault_b=None,
+            fee_rate=None,
+        )
+
+
+def decode_spl_mint_decimals(account_data: bytes) -> Optional[int]:
+    # SPL Mint layout: decimals is u8 at offset 44.
+    if len(account_data) < 45:
+        return None
+    return _read_u8(account_data, 44)
+
+
+def decode_spl_token_account_amount(account_data: bytes) -> Optional[int]:
+    # SPL Token Account layout: amount u64 at offset 64.
+    if len(account_data) < 72:
+        return None
+    return _read_u64_le(account_data, 64)
+
+
+@dataclass
+class OrcaTick:
+    tick_index: int
+    initialized: bool
+    liquidity_net: int
+    liquidity_gross: int
+
+
+def decode_orca_fixed_tick_array(
+    account_data: bytes, *, tick_spacing: int
+) -> Tuple[Optional[int], List[OrcaTick]]:
+    if len(account_data) < 8 + 4 + 32:
+        return None, []
+    if account_data[:8] != FIXED_TICK_ARRAY_DISCRIMINATOR:
+        return None, []
+    start_tick_index = _read_i32_le(account_data, 8)
+    ticks_off = 12
+    tick_size = 113
+    out: List[OrcaTick] = []
+    for i in range(TICKS_PER_TICK_ARRAY):
+        off = ticks_off + i * tick_size
+        if off + tick_size > len(account_data):
+            break
+        initialized = account_data[off] != 0
+        liq_net = _read_i128_le(account_data, off + 1)
+        liq_gross = _read_u128_le(account_data, off + 17)
+        if not initialized and liq_net == 0 and liq_gross == 0:
+            continue
+        tick_index = start_tick_index + i * tick_spacing
+        out.append(
+            OrcaTick(
+                tick_index=tick_index,
+                initialized=initialized,
+                liquidity_net=liq_net,
+                liquidity_gross=liq_gross,
+            )
+        )
+    return start_tick_index, out
+
+
+def _ceil_div(a: int, b: int) -> int:
+    return -(-a // b)
+
+
+def _align_tick_floor(tick: int, spacing: int) -> int:
+    return (tick // spacing) * spacing
+
+
+def _align_tick_ceil(tick: int, spacing: int) -> int:
+    return _ceil_div(tick, spacing) * spacing
+
+
+def _orca_tick_array_start_index(tick_index: int, tick_spacing: int) -> int:
+    span = tick_spacing * TICKS_PER_TICK_ARRAY
+    return (tick_index // span) * span
+
+
+def _meteora_bin_window(active_id: int, bin_step: int, pct: float) -> Tuple[int, int]:
+    if bin_step <= 0:
+        return active_id, active_id
+    r = 1.0 + (bin_step / 10_000.0)
+    if r <= 1.0:
+        return active_id, active_id
+    lo = math.log(1.0 - pct) / math.log(r)
+    hi = math.log(1.0 + pct) / math.log(r)
+    dmin = int(math.ceil(lo))
+    dmax = int(math.floor(hi))
+    return active_id + dmin, active_id + dmax
+
+
+def _orca_tick_window(
+    tick_current_index: int, tick_spacing: int, pct: float
+) -> Tuple[int, int]:
+    ln_base = math.log(1.0001)
+    lo = math.log(1.0 - pct) / ln_base
+    hi = math.log(1.0 + pct) / ln_base
+    tmin = int(math.floor(tick_current_index + lo))
+    tmax = int(math.ceil(tick_current_index + hi))
+    return _align_tick_floor(tmin, tick_spacing), _align_tick_ceil(tmax, tick_spacing)
+
+
+def _sqrt_price_from_tick(tick_index: int) -> Decimal:
+    x = math.exp(math.log(1.0001) * (tick_index / 2.0))
+    return Decimal(str(x))
+
+
+def _sqrt_price_x64_to_decimal(sqrt_price_x64: int) -> Decimal:
+    return Decimal(sqrt_price_x64) / Decimal(2**64)
+
+
+def _orca_price_ui_from_sqrt_price(
+    sqrt_price_x64: int, decimals_a: int, decimals_b: int
+) -> float:
+    sp = float(Decimal(sqrt_price_x64) / Decimal(2**64))
+    price_raw = sp * sp
+    return float(price_raw * (10 ** (decimals_a - decimals_b)))
+
+
+def _amounts_for_liquidity_interval(
+    liquidity: int, sqrt_pa: Decimal, sqrt_pb: Decimal, sqrt_p: Decimal
+) -> Tuple[Decimal, Decimal]:
+    if liquidity <= 0:
+        return Decimal(0), Decimal(0)
+    L = Decimal(liquidity)
+    if sqrt_p <= sqrt_pa:
+        amt_a = L * (sqrt_pb - sqrt_pa) / (sqrt_pa * sqrt_pb)
+        return amt_a, Decimal(0)
+    if sqrt_p >= sqrt_pb:
+        amt_b = L * (sqrt_pb - sqrt_pa)
+        return Decimal(0), amt_b
+    amt_a = L * (sqrt_pb - sqrt_p) / (sqrt_p * sqrt_pb)
+    amt_b = L * (sqrt_p - sqrt_pa)
+    return amt_a, amt_b
+
+
+def _safe_token_decimals_from_api(token_obj: Any) -> Optional[int]:
+    if not isinstance(token_obj, dict):
+        return None
+    d = token_obj.get("decimals")
+    try:
+        if d is None:
+            return None
+        return int(d)
+    except Exception:
+        return None
+
+
+def liquidity(
+    *,
+    db_path: str,
+    query: str,
+    tvl_min_usd: float,
+    page_size: int,
+    sleep_s: float,
+    rpc_url: str,
+    orca_pool: str,
+    thresholds_pct: List[float],
+    raw_bins_each_side: int,
+) -> int:
+    _ = ensure_db(db_path)  # keep consistent environment; do not write.
+    session = requests.Session()
+
+    pools = meteora_list_pools(
+        session,
+        query=query,
+        page_size=page_size,
+        filter_by=None,
+        sleep_s=sleep_s,
+    )
+    sol_usdc = [p for p in pools if is_sol_usdc_pool(p)]
+    if not sol_usdc:
+        eprint("No SOL-USDC pools found in Meteora /pools response.")
+        return 2
+
+    def tvl_of(p: Dict[str, Any]) -> float:
+        return float(p.get("tvl") or 0.0)
+
+    top_pool = max(sol_usdc, key=tvl_of)
+    selected = [p for p in sol_usdc if tvl_of(p) >= tvl_min_usd]
+    if all((p.get("address") != top_pool.get("address")) for p in selected):
+        selected.append(top_pool)
+    selected.sort(key=tvl_of, reverse=True)
+
+    must_include = "5rCf1DM8LjKTw4YqhnoLcngyZYeNnQqztScTogYHAS6"
+    if all((p.get("address") != must_include) for p in selected):
+        for p in sol_usdc:
+            if p.get("address") == must_include:
+                selected.append(p)
+                break
+        else:
+            selected.append({"address": must_include, "name": "SOL-USDC (requested)"})
+
+    # -------- Orca on-chain state --------
+    orca_info = solana_get_account_info(session, rpc_url, orca_pool, sleep_s=sleep_s)
+    if not orca_info.data_base64:
+        eprint("Orca: getAccountInfo returned no base64 data for whirlpool.")
+        return 2
+    whirlpool_bytes = base64.b64decode(orca_info.data_base64)
+    whirl = decode_orca_whirlpool(whirlpool_bytes)
+    if (
+        (not whirl.discriminator_ok)
+        or whirl.tick_spacing is None
+        or whirl.sqrt_price_x64 is None
+        or whirl.tick_current_index is None
+        or whirl.liquidity is None
+    ):
+        eprint("Orca: failed to decode Whirlpool account (unexpected layout).")
+        return 2
+    if not whirl.token_mint_a or not whirl.token_mint_b or not whirl.token_vault_a or not whirl.token_vault_b:
+        eprint("Orca: missing token mint/vault fields in decoded Whirlpool.")
+        return 2
+
+    mint_accounts = solana_get_multiple_accounts(
+        session,
+        rpc_url,
+        [whirl.token_mint_a, whirl.token_mint_b],
+        sleep_s=sleep_s,
+        chunk_size=100,
+    )
+    dec_a = decode_spl_mint_decimals(mint_accounts.get(whirl.token_mint_a) or b"")
+    dec_b = decode_spl_mint_decimals(mint_accounts.get(whirl.token_mint_b) or b"")
+    if dec_a is None or dec_b is None:
+        eprint("Orca: failed to decode SPL mint decimals.")
+        return 2
+
+    vault_accounts = solana_get_multiple_accounts(
+        session,
+        rpc_url,
+        [whirl.token_vault_a, whirl.token_vault_b],
+        sleep_s=sleep_s,
+        chunk_size=100,
+    )
+    vault_a_amt = decode_spl_token_account_amount(
+        vault_accounts.get(whirl.token_vault_a) or b""
+    )
+    vault_b_amt = decode_spl_token_account_amount(
+        vault_accounts.get(whirl.token_vault_b) or b""
+    )
+    if vault_a_amt is None or vault_b_amt is None:
+        eprint("Orca: failed to decode SPL token vault balances.")
+        return 2
+
+    price_ui_b_per_a = _orca_price_ui_from_sqrt_price(
+        int(whirl.sqrt_price_x64), dec_a, dec_b
+    )
+
+    def orca_tvl_usd_and_price_sol() -> Tuple[float, float]:
+        mint_a = whirl.token_mint_a or ""
+        mint_b = whirl.token_mint_b or ""
+        amt_a_ui = vault_a_amt / (10**dec_a)
+        amt_b_ui = vault_b_amt / (10**dec_b)
+        if mint_a == ORCA_SOL_MINT and mint_b == ORCA_USDC_MINT:
+            sol_price = price_ui_b_per_a
+            return float(amt_a_ui * sol_price + amt_b_ui), float(sol_price)
+        if mint_a == ORCA_USDC_MINT and mint_b == ORCA_SOL_MINT:
+            sol_price = 1.0 / price_ui_b_per_a if price_ui_b_per_a else float("nan")
+            return float(amt_b_ui * sol_price + amt_a_ui), float(sol_price)
+        tvl = amt_a_ui * price_ui_b_per_a + amt_b_ui
+        return float(tvl), float("nan")
+
+    orca_tvl, orca_sol_price = orca_tvl_usd_and_price_sol()
+
+    print("Liquidity density snapshot (read-only).")
+    print(f"RPC: {rpc_url}")
+    print("")
+    print("Chosen data sources:")
+    print("- Meteora bin distribution: on-chain `BinArray` accounts (DLMM program) + TVL/USD prices from Meteora Data API `/pools/{address}`.")
+    print("- Orca tick distribution: on-chain `Whirlpool` + `TickArray` accounts + on-chain vault balances for TVL (priced by on-chain pool price).")
+    print("")
+
+    # -------- Orca: list tick arrays (light) then fetch only needed --------
+    tick_spacing = int(whirl.tick_spacing)
+    tick_current = int(whirl.tick_current_index)
+    active_liq = int(whirl.liquidity)
+    sqrt_p = _sqrt_price_x64_to_decimal(int(whirl.sqrt_price_x64))
+
+    max_pct = max(thresholds_pct) if thresholds_pct else 3.0
+    orca_tmin, orca_tmax = _orca_tick_window(tick_current, tick_spacing, max_pct / 100.0)
+    need_start_min = _orca_tick_array_start_index(orca_tmin, tick_spacing)
+    need_start_max = _orca_tick_array_start_index(orca_tmax, tick_spacing)
+
+    tick_arrays_light = solana_get_program_accounts(
+        session,
+        rpc_url,
+        ORCA_WHIRLPOOL_PROGRAM_ID,
+        filters=[
+            {"dataSize": 9988},
+            {"memcmp": {"offset": 9956, "bytes": orca_pool}},
+        ],
+        data_slice={"offset": 8, "length": 4},
+        sleep_s=sleep_s,
+    )
+    start_to_pubkey: Dict[int, str] = {}
+    for it in tick_arrays_light:
+        pk = it.get("pubkey")
+        acc = it.get("account") or {}
+        data = acc.get("data")
+        if not isinstance(pk, str):
+            continue
+        if not (isinstance(data, list) and data and isinstance(data[0], str)):
+            continue
+        try:
+            b = base64.b64decode(data[0])
+            if len(b) != 4:
+                continue
+            start = int.from_bytes(b, "little", signed=True)
+            start_to_pubkey[start] = pk
+        except Exception:
+            continue
+
+    required_starts: List[int] = []
+    s = need_start_min
+    span = tick_spacing * TICKS_PER_TICK_ARRAY
+    while s <= need_start_max:
+        required_starts.append(s)
+        s += span
+
+    required_tick_array_pubkeys = [
+        start_to_pubkey[s] for s in required_starts if s in start_to_pubkey
+    ]
+    tick_array_bytes = solana_get_multiple_accounts(
+        session,
+        rpc_url,
+        required_tick_array_pubkeys,
+        sleep_s=sleep_s,
+        chunk_size=50,
+    )
+    liq_net_by_tick: Dict[int, int] = {}
+    initialized_ticks_sample: List[OrcaTick] = []
+    for _pk, data_bytes in tick_array_bytes.items():
+        if not data_bytes:
+            continue
+        _start, ticks = decode_orca_fixed_tick_array(
+            data_bytes, tick_spacing=tick_spacing
+        )
+        for t in ticks:
+            liq_net_by_tick[t.tick_index] = int(t.liquidity_net)
+            if len(initialized_ticks_sample) < 30 and t.initialized:
+                initialized_ticks_sample.append(t)
+
+    def orca_window_value_usd(pct: float) -> Tuple[float, int, int]:
+        tmin, tmax = _orca_tick_window(tick_current, tick_spacing, pct)
+        cur_lower = _align_tick_floor(tick_current, tick_spacing)
+
+        L_by_interval: Dict[int, int] = {}
+        if cur_lower >= tmin and cur_lower < tmax:
+            L_by_interval[cur_lower] = active_liq
+
+        # Upward
+        L = active_liq
+        t = cur_lower
+        while t + tick_spacing <= tmax:
+            boundary = t + tick_spacing
+            L = L + int(liq_net_by_tick.get(boundary, 0))
+            if boundary >= tmin and boundary < tmax:
+                L_by_interval[boundary] = int(L)
+            t += tick_spacing
+
+        # Downward
+        L = active_liq
+        t = cur_lower
+        while t > tmin:
+            boundary = t
+            L = L - int(liq_net_by_tick.get(boundary, 0))
+            lower = t - tick_spacing
+            if lower >= tmin and lower < tmax:
+                L_by_interval[lower] = int(L)
+            t -= tick_spacing
+
+        amt_a = Decimal(0)
+        amt_b = Decimal(0)
+        tt = tmin
+        while tt < tmax:
+            Lint = int(L_by_interval.get(tt, 0))
+            if Lint != 0:
+                sqrt_pa = _sqrt_price_from_tick(tt)
+                sqrt_pb = _sqrt_price_from_tick(tt + tick_spacing)
+                a, b = _amounts_for_liquidity_interval(Lint, sqrt_pa, sqrt_pb, sqrt_p)
+                amt_a += a
+                amt_b += b
+            tt += tick_spacing
+
+        a_ui = float(amt_a / Decimal(10**dec_a))
+        b_ui = float(amt_b / Decimal(10**dec_b))
+        mint_a = whirl.token_mint_a or ""
+        mint_b = whirl.token_mint_b or ""
+        if mint_a == ORCA_SOL_MINT and mint_b == ORCA_USDC_MINT:
+            return float(a_ui * orca_sol_price + b_ui), tmin, tmax
+        if mint_a == ORCA_USDC_MINT and mint_b == ORCA_SOL_MINT:
+            return float(b_ui * orca_sol_price + a_ui), tmin, tmax
+        return float(a_ui * price_ui_b_per_a + b_ui), tmin, tmax
+
+    orca_shares: Dict[float, float] = {}
+    for pct in thresholds_pct:
+        val, _tmin, _tmax = orca_window_value_usd(pct / 100.0)
+        share = (
+            val / orca_tvl
+            if (orca_tvl and orca_tvl > 0 and math.isfinite(val))
+            else float("nan")
+        )
+        orca_shares[pct] = share
+
+    def meteora_pool_density(addr: str) -> Tuple[Optional[float], Dict[float, float], Dict[str, Any]]:
+        details = meteora_pool_details(session, addr, sleep_s=sleep_s)
+        tvl = compute_tvl_usd(details)
+        if tvl is None or tvl <= 0:
+            return None, {}, {"error": "tvl missing/invalid from Meteora pool details"}
+
+        token_x = details.get("token_x") if isinstance(details, dict) else None
+        token_y = details.get("token_y") if isinstance(details, dict) else None
+        px = parse_float(safe_get(details, "token_x", "price"))
+        py = parse_float(safe_get(details, "token_y", "price"))
+        dec_x = _safe_token_decimals_from_api(token_x)
+        dec_y = _safe_token_decimals_from_api(token_y)
+        mx = safe_get(details, "token_x", "mint")
+        my = safe_get(details, "token_y", "mint")
+
+        rpc_info = solana_get_account_info(session, rpc_url, addr, sleep_s=sleep_s)
+        if not rpc_info.data_base64:
+            return float(tvl), {}, {"error": "no base64 data from getAccountInfo(lb_pair)"}
+        lb_bytes = base64.b64decode(rpc_info.data_base64)
+        st = decode_lbpair_state(lb_bytes)
+        if st.active_id is None or st.bin_step is None:
+            return float(tvl), {}, {"error": "failed to decode active_id/bin_step from LbPair"}
+        active_id = int(st.active_id)
+        bin_step = int(st.bin_step)
+
+        if dec_x is None or dec_y is None:
+            mints_to_fetch: List[str] = []
+            if isinstance(mx, str):
+                mints_to_fetch.append(mx)
+            if isinstance(my, str):
+                mints_to_fetch.append(my)
+            if mints_to_fetch:
+                mint_map = solana_get_multiple_accounts(
+                    session, rpc_url, mints_to_fetch, sleep_s=sleep_s, chunk_size=100
+                )
+                if dec_x is None and isinstance(mx, str):
+                    dec_x = decode_spl_mint_decimals(mint_map.get(mx) or b"")
+                if dec_y is None and isinstance(my, str):
+                    dec_y = decode_spl_mint_decimals(mint_map.get(my) or b"")
+
+        if None in (px, py, dec_x, dec_y):
+            return float(tvl), {}, {
+                "error": "missing token prices/decimals needed to value bin liquidity",
+                "active_id": active_id,
+                "bin_step": bin_step,
+            }
+
+        want_bin_ids: set = set()
+        for pct in thresholds_pct:
+            bmin, bmax = _meteora_bin_window(active_id, bin_step, pct / 100.0)
+            for b in range(bmin, bmax + 1):
+                want_bin_ids.add(b)
+
+        arr_idx_min = min(want_bin_ids) // BINS_PER_BIN_ARRAY
+        arr_idx_max = max(want_bin_ids) // BINS_PER_BIN_ARRAY
+        want_arr_indexes = set(range(arr_idx_min, arr_idx_max + 1))
+
+        binarrays_light = solana_get_program_accounts(
+            session,
+            rpc_url,
+            DLMM_PROGRAM_ID,
+            filters=[
+                {"dataSize": 10136},
+                {"memcmp": {"offset": 24, "bytes": addr}},
+            ],
+            data_slice={"offset": 8, "length": 16},
+            sleep_s=sleep_s,
+        )
+        if not binarrays_light:
+            # Defensive fallback: if account size changes, retry without dataSize filter
+            # and rely on discriminator check during full decode.
+            binarrays_light = solana_get_program_accounts(
+                session,
+                rpc_url,
+                DLMM_PROGRAM_ID,
+                filters=[
+                    {"memcmp": {"offset": 24, "bytes": addr}},
+                ],
+                data_slice={"offset": 8, "length": 16},
+                sleep_s=sleep_s,
+            )
+        idx_to_pubkey: Dict[int, str] = {}
+        for it in binarrays_light:
+            pk = it.get("pubkey")
+            acc = it.get("account") or {}
+            data = acc.get("data")
+            if not isinstance(pk, str):
+                continue
+            if not (isinstance(data, list) and data and isinstance(data[0], str)):
+                continue
+            try:
+                b = base64.b64decode(data[0])
+                if len(b) < 8:
+                    continue
+                idx = int.from_bytes(b[:8], "little", signed=True)
+                if idx in want_arr_indexes:
+                    idx_to_pubkey[idx] = pk
+            except Exception:
+                continue
+
+        need_pubkeys = [idx_to_pubkey[i] for i in sorted(want_arr_indexes) if i in idx_to_pubkey]
+        full_map = solana_get_multiple_accounts(
+            session, rpc_url, need_pubkeys, sleep_s=sleep_s, chunk_size=30
+        )
+
+        bin_amount_x: Dict[int, int] = {}
+        bin_amount_y: Dict[int, int] = {}
+        raw_bins_near_active: List[Dict[str, Any]] = []
+        for _pk, b in full_map.items():
+            if not b:
+                continue
+            _idx, _lb_pair, rows = decode_binarray_bins_subset(b, want_bin_ids=want_bin_ids)
+            for r in rows:
+                bin_amount_x[r.bin_id] = bin_amount_x.get(r.bin_id, 0) + int(r.amount_x)
+                bin_amount_y[r.bin_id] = bin_amount_y.get(r.bin_id, 0) + int(r.amount_y)
+                if abs(r.bin_id - active_id) <= raw_bins_each_side and len(raw_bins_near_active) < (2 * raw_bins_each_side + 1):
+                    raw_bins_near_active.append(
+                        {"bin_id": r.bin_id, "amount_x": r.amount_x, "amount_y": r.amount_y}
+                    )
+
+        shares: Dict[float, float] = {}
+        for pct in thresholds_pct:
+            bmin, bmax = _meteora_bin_window(active_id, bin_step, pct / 100.0)
+            val = 0.0
+            for b in range(bmin, bmax + 1):
+                ax = bin_amount_x.get(b, 0)
+                ay = bin_amount_y.get(b, 0)
+                if ax == 0 and ay == 0:
+                    continue
+                ax_ui = ax / (10**int(dec_x))
+                ay_ui = ay / (10**int(dec_y))
+                val += ax_ui * float(px) + ay_ui * float(py)
+            shares[pct] = val / float(tvl) if tvl else float("nan")
+
+        extra = {
+            "active_id": active_id,
+            "bin_step": bin_step,
+            "tvl_usd": float(tvl),
+            "raw_bins_near_active": sorted(raw_bins_near_active, key=lambda x: x["bin_id"]),
+        }
+        return float(tvl), shares, extra
+
+    print("Table (share of pool TVL value in window around current price).")
+    hdr = (
+        f"{'platform':<8}  {'pool':<44}  {'tvl_usd':>12}  "
+        + "  ".join([f"±{p:.1f}%".rjust(8) for p in thresholds_pct])
+    )
+    print(hdr)
+    print("-" * len(hdr))
+    print(
+        f"{'Orca':<8}  {orca_pool:<44}  {orca_tvl:>12.0f}  "
+        + "  ".join([f"{(orca_shares.get(p) or float('nan'))*100:>7.2f}%" for p in thresholds_pct])
+    )
+
+    meteora_rows: List[Tuple[str, float, Dict[float, float], Dict[str, Any]]] = []
+    for p in selected:
+        addr = p.get("address") or p.get("lb_pair") or p.get("public_key")
+        if not addr:
+            continue
+        tvl, shares, extra = meteora_pool_density(addr)
+        if tvl is None:
+            continue
+        meteora_rows.append((addr, float(tvl), shares, extra))
+        print(
+            f"{'Meteora':<8}  {addr:<44}  {tvl:>12.0f}  "
+            + "  ".join([f"{(shares.get(pp) or float('nan'))*100:>7.2f}%" for pp in thresholds_pct])
+        )
+
+    print("")
+    print("Raw fragments (to prove inputs are real, not invented):")
+    print("")
+    print(f"Orca whirlpool {orca_pool}:")
+    print(f"- tick_current_index={tick_current} tick_spacing={tick_spacing} active_liquidity={active_liq}")
+    print(f"- vaults: A={whirl.token_vault_a} amount={vault_a_amt} (decimals={dec_a}), B={whirl.token_vault_b} amount={vault_b_amt} (decimals={dec_b})")
+    if math.isfinite(orca_sol_price):
+        print(f"- price (SOL USD) from sqrtPrice: ${orca_sol_price:.4f}")
+    if whirl.fee_rate is not None:
+        print(f"- fee_rate (u16): {whirl.fee_rate}")
+    if initialized_ticks_sample:
+        initialized_ticks_sample.sort(key=lambda t: t.tick_index)
+        print("- sample initialized ticks (tick_index, liquidityNet, liquidityGross):")
+        for t in initialized_ticks_sample[:12]:
+            print(f"  - {t.tick_index:>8}  net={t.liquidity_net}  gross={t.liquidity_gross}")
+    print("")
+
+    for (addr, _tvl, _shares, extra) in meteora_rows[:5]:
+        print(f"Meteora lb_pair {addr}: active_id={extra.get('active_id')} bin_step={extra.get('bin_step')} (bps)")
+        raw_bins = extra.get("raw_bins_near_active") or []
+        if raw_bins:
+            print(f"- sample bins near active (bin_id, amount_x, amount_y) [base units]:")
+            for r in raw_bins[: (2 * raw_bins_each_side + 1)]:
+                print(f"  - {r['bin_id']:>8}  x={r['amount_x']}  y={r['amount_y']}")
+        print("")
+
+    try:
+        stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        out_path = f"/tmp/meteora-watch-liquidity-{stamp}.json"
+        payload = {
+            "rpc_url": rpc_url,
+            "orca": {
+                "pool": orca_pool,
+                "tick_current_index": tick_current,
+                "tick_spacing": tick_spacing,
+                "active_liquidity": active_liq,
+                "tvl_usd": orca_tvl,
+                "shares": {str(k): v for k, v in orca_shares.items()},
+                "vault_a": {"pubkey": whirl.token_vault_a, "amount": vault_a_amt, "decimals": dec_a},
+                "vault_b": {"pubkey": whirl.token_vault_b, "amount": vault_b_amt, "decimals": dec_b},
+            },
+            "meteora": [
+                {
+                    "pool": a,
+                    "tvl_usd": tvl,
+                    "active_id": extra.get("active_id"),
+                    "bin_step": extra.get("bin_step"),
+                    "shares": {str(k): v for k, v in shares.items()},
+                    "raw_bins_near_active": extra.get("raw_bins_near_active"),
+                }
+                for (a, tvl, shares, extra) in meteora_rows
+            ],
+        }
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+        print(f"Saved /tmp dump: {out_path}")
+    except Exception as exc:
+        eprint(f"WARN: failed to write /tmp dump: {exc}")
+
+    if meteora_rows:
+        top_m = meteora_rows[0]
+        m_sh = top_m[2]
+        print("")
+        print("Quick check vs observed APR ratio (~1.8x):")
+        for pct in thresholds_pct:
+            sm = m_sh.get(pct)
+            so = orca_shares.get(pct)
+            if sm is None or so is None or sm <= 0 or so <= 0:
+                continue
+            ratio = sm / so
+            print(f"- window ±{pct:.1f}%: Meteora_share/Orca_share = {ratio:.2f}x")
+        print("Interpretation: if fee-per-working-dollar is similar, reported APR (fees / total TVL) should scale roughly with the working-share.")
+
+    return 0
 
 
 def collect(
@@ -891,6 +1833,44 @@ def main(argv: Optional[List[str]] = None) -> int:
         help="Solana RPC URL (default: api.mainnet-beta.solana.com).",
     )
 
+    p_liq = sub.add_parser(
+        "liquidity",
+        help="Read-only snapshot: share of liquidity near current price (Meteora bins vs Orca ticks).",
+    )
+    p_liq.add_argument(
+        "--query",
+        default=os.environ.get("MW_QUERY", "SOL-USDC"),
+        help="Meteora /pools query (default: SOL-USDC).",
+    )
+    p_liq.add_argument(
+        "--tvl-min",
+        type=float,
+        default=float(os.environ.get("MW_TVL_MIN", "500000")),
+        help="Include Meteora SOL-USDC pools with TVL >= this, plus top TVL, plus requested pool.",
+    )
+    p_liq.add_argument("--page-size", type=int, default=1000)
+    p_liq.add_argument(
+        "--rpc-url",
+        default=os.environ.get("SOLANA_RPC_URL", SOLANA_MAINNET_RPC_DEFAULT),
+        help="Solana RPC URL (default: api.mainnet-beta.solana.com).",
+    )
+    p_liq.add_argument(
+        "--orca-pool",
+        default=ORCA_SOL_USDC_POOL,
+        help="Orca SOL-USDC Whirlpool address.",
+    )
+    p_liq.add_argument(
+        "--thresholds",
+        default="0.5,1,3",
+        help="Comma-separated percent thresholds (default: 0.5,1,3).",
+    )
+    p_liq.add_argument(
+        "--raw-bins",
+        type=int,
+        default=6,
+        help="How many Meteora bins on each side of active to print (default: 6).",
+    )
+
     args = parser.parse_args(argv)
 
     if args.cmd == "collect":
@@ -914,6 +1894,29 @@ def main(argv: Optional[List[str]] = None) -> int:
         )
     if args.cmd == "rpc-dump":
         return rpc_dump(rpc_url=args.rpc_url, pool=args.pool, sleep_s=args.sleep)
+    if args.cmd == "liquidity":
+        try:
+            thresholds = [
+                float(x.strip())
+                for x in str(args.thresholds).split(",")
+                if x.strip()
+            ]
+        except Exception:
+            thresholds = [0.5, 1.0, 3.0]
+        thresholds = [x for x in thresholds if x > 0]
+        if not thresholds:
+            thresholds = [0.5, 1.0, 3.0]
+        return liquidity(
+            db_path=args.db,
+            query=args.query,
+            tvl_min_usd=args.tvl_min,
+            page_size=args.page_size,
+            sleep_s=args.sleep,
+            rpc_url=args.rpc_url,
+            orca_pool=args.orca_pool,
+            thresholds_pct=thresholds,
+            raw_bins_each_side=int(args.raw_bins),
+        )
     raise RuntimeError("unreachable")
 
 
